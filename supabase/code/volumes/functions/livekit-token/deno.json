@@ -1,0 +1,6 @@
+{
+  "imports": {
+    "@supabase/supabase-js": "npm:@supabase/supabase-js@^2",
+    "livekit-server-sdk": "npm:livekit-server-sdk@2.19.1"
+  }
+}
