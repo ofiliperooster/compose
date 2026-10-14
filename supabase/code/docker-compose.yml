@@ -474,11 +474,34 @@ services:
       HOTMART_BASIC_TOKEN: ${HOTMART_BASIC_TOKEN}
       HOTMART_PRODUCT_ID: ${HOTMART_PRODUCT_ID}
       HOTMART_ROSTER_STATUSES: "${HOTMART_ROSTER_STATUSES:-ACTIVE,DELAYED,OVERDUE}"
+      HOTMART_ROSTER_ACCESSION_DATE: "${HOTMART_ROSTER_ACCESSION_DATE:-0}"
       PUSH_WORKER_SECRET: ${PUSH_WORKER_SECRET}
       EXPO_ACCESS_TOKEN: ${EXPO_ACCESS_TOKEN:-}
       ONESIGNAL_APP_ID: ${ONESIGNAL_APP_ID}
       ONESIGNAL_REST_API_KEY: ${ONESIGNAL_REST_API_KEY}
     command: [ "start", "--main-service", "/home/deno/functions/main" ]
+
+  push-worker:
+    image: alpine:3.21
+    restart: unless-stopped
+    depends_on:
+      functions:
+        condition: service_started
+    environment:
+      PUSH_WORKER_SECRET: ${PUSH_WORKER_SECRET}
+    command:
+      - /bin/sh
+      - -c
+      - |
+        while true; do
+          wget --quiet --timeout=25 --tries=1 \
+            --header="Content-Type: application/json" \
+            --header="x-worker-secret: $${PUSH_WORKER_SECRET}" \
+            --post-data='{}' \
+            http://functions:9000/push-dispatch \
+            -O - || true
+          sleep 60
+        done
 
   analytics:
     image: supabase/logflare:1.36.1
