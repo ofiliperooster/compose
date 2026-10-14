@@ -5,6 +5,11 @@ console.log('main function started')
 const JWT_SECRET = Deno.env.get('JWT_SECRET')
 const SUPABASE_URL = Deno.env.get('SUPABASE_URL')
 const VERIFY_JWT = Deno.env.get('VERIFY_JWT') === 'true'
+const corsHeaders = {
+  'Access-Control-Allow-Origin': '*',
+  'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type',
+  'Access-Control-Allow-Methods': 'POST, OPTIONS',
+}
 
 // Create JWKS for ES256/RS256 tokens (newer tokens)
 let SUPABASE_JWT_KEYS: ReturnType<typeof jose.createRemoteJWKSet> | null = null
@@ -105,6 +110,9 @@ async function isValidHybridJWT(jwt: string): Promise<boolean> {
 }
 
 Deno.serve(async (req: Request) => {
+  if (req.method === 'OPTIONS') {
+    return new Response('ok', { headers: corsHeaders })
+  }
   if (req.method !== 'OPTIONS' && VERIFY_JWT) {
     try {
       const token = getAuthToken(req)
@@ -113,14 +121,14 @@ Deno.serve(async (req: Request) => {
       if (!isValidJWT) {
         return new Response(JSON.stringify({ msg: 'Invalid JWT' }), {
           status: 401,
-          headers: { 'Content-Type': 'application/json' },
+          headers: { ...corsHeaders, 'Content-Type': 'application/json' },
         })
       }
     } catch (e) {
       console.error(e)
       return new Response(JSON.stringify({ msg: e.toString() }), {
         status: 401,
-        headers: { 'Content-Type': 'application/json' },
+        headers: { ...corsHeaders, 'Content-Type': 'application/json' },
       })
     }
   }
@@ -134,7 +142,7 @@ Deno.serve(async (req: Request) => {
     const error = { msg: 'missing function name in request' }
     return new Response(JSON.stringify(error), {
       status: 400,
-      headers: { 'Content-Type': 'application/json' },
+      headers: { ...corsHeaders, 'Content-Type': 'application/json' },
     })
   }
 
@@ -162,7 +170,7 @@ Deno.serve(async (req: Request) => {
     const error = { msg: e.toString() }
     return new Response(JSON.stringify(error), {
       status: 500,
-      headers: { 'Content-Type': 'application/json' },
+      headers: { ...corsHeaders, 'Content-Type': 'application/json' },
     })
   }
 })

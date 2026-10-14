@@ -1,7 +1,9 @@
 import { createClient } from "@supabase/supabase-js";
 
 type Outbox = { id: string; user_id: string; category: "community" | "lives" | "security" | "system"; title: string; body: string; data: Record<string, unknown>; attempts: number };
+type PushToken = { id: string; push_token: string; provider: string };
 const json = (body: unknown, status = 200) => Response.json(body, { status, headers: { "Cache-Control": "no-store" } });
+const oneSignalAppId = Deno.env.get("ONESIGNAL_APP_ID") || "8d71b5d4-7668-4542-9d1f-86fb9172cf20";
 
 Deno.serve(async (req) => {
   const workerSecret = Deno.env.get("PUSH_WORKER_SECRET");
@@ -78,24 +80,60 @@ Deno.serve(async (req) => {
       continue;
     }
 
-    const { data: tokens, error: tokensError } = await admin.from("device_push_tokens").select("id,push_token").eq("user_id", job.user_id).eq("notifications_enabled", true).is("invalidated_at", null);
+    const { data: tokens, error: tokensError } = await admin.from("device_push_tokens").select("id,push_token,provider").eq("user_id", job.user_id).eq("notifications_enabled", true).is("invalidated_at", null);
     if (tokensError) throw new Error(`Falha ao buscar dispositivos: ${tokensError.message}`);
     if (!tokens?.length) {
       await admin.from("notification_outbox").update({ status: "failed", processed_at: new Date().toISOString(), last_error: "Nenhum token ativo" }).eq("id", job.id);
       continue;
     }
-      const headers: Record<string, string> = { "Content-Type": "application/json" };
-      const accessToken = Deno.env.get("EXPO_ACCESS_TOKEN");
-      if (accessToken) headers.Authorization = `Bearer ${accessToken}`;
-      const response = await fetch("https://exp.host/--/api/v2/push/send", { method: "POST", headers, body: JSON.stringify(tokens.map((token) => ({ to: token.push_token, title: job.title, body: job.body, data: job.data, sound: "default" }))) });
-      const result = await response.json();
-      if (!response.ok) throw new Error(JSON.stringify(result));
-      const tickets = Array.isArray(result.data) ? result.data : [result.data];
-      for (let index = 0; index < tokens.length; index += 1) {
-        const ticket = tickets[index] || {};
-        const invalid = ticket?.details?.error === "DeviceNotRegistered";
-        await admin.from("notification_deliveries").insert({ outbox_id: job.id, token_id: tokens[index].id, provider_ticket_id: ticket.id || null, status: ticket.status === "ok" ? "accepted" : "failed", provider_response: ticket });
-        if (invalid) await admin.from("device_push_tokens").update({ notifications_enabled: false, invalidated_at: new Date().toISOString() }).eq("id", tokens[index].id);
+      const pushTokens = tokens as PushToken[];
+      const oneSignalTokens = pushTokens.filter((token) => token.provider === "onesignal");
+      const expoTokens = pushTokens.filter((token) => token.provider !== "onesignal");
+      const imageUrl = typeof job.data.image_url === "string" && /^https:\/\//i.test(job.data.image_url)
+        ? job.data.image_url
+        : null;
+
+      if (oneSignalTokens.length) {
+        const apiKey = Deno.env.get("ONESIGNAL_REST_API_KEY");
+        if (!apiKey) throw new Error("ONESIGNAL_REST_API_KEY não configurada");
+        const response = await fetch("https://api.onesignal.com/notifications", {
+          method: "POST",
+          headers: { "Content-Type": "application/json; charset=utf-8", Authorization: `Key ${apiKey}` },
+          body: JSON.stringify({
+            app_id: oneSignalAppId,
+            target_channel: "push",
+            include_subscription_ids: oneSignalTokens.map((token) => token.push_token),
+            headings: { en: job.title },
+            contents: { en: job.body },
+            data: job.data,
+            ...(imageUrl ? {
+              big_picture: imageUrl,
+              chrome_web_image: imageUrl,
+              ios_attachments: { image: imageUrl },
+            } : {}),
+          }),
+        });
+        const result = await response.json().catch(() => ({}));
+        if (!response.ok) throw new Error(`OneSignal: ${JSON.stringify(result)}`);
+        for (const token of oneSignalTokens) {
+          await admin.from("notification_deliveries").insert({ outbox_id: job.id, token_id: token.id, provider_ticket_id: null, status: "accepted", provider_response: result });
+        }
+      }
+
+      if (expoTokens.length) {
+        const headers: Record<string, string> = { "Content-Type": "application/json" };
+        const accessToken = Deno.env.get("EXPO_ACCESS_TOKEN");
+        if (accessToken) headers.Authorization = `Bearer ${accessToken}`;
+        const response = await fetch("https://exp.host/--/api/v2/push/send", { method: "POST", headers, body: JSON.stringify(expoTokens.map((token) => ({ to: token.push_token, title: job.title, body: job.body, data: job.data, sound: "default", ...(imageUrl ? { richContent: { image: imageUrl } } : {}) }))) });
+        const result = await response.json();
+        if (!response.ok) throw new Error(JSON.stringify(result));
+        const tickets = Array.isArray(result.data) ? result.data : [result.data];
+        for (let index = 0; index < expoTokens.length; index += 1) {
+          const ticket = tickets[index] || {};
+          const invalid = ticket?.details?.error === "DeviceNotRegistered";
+          await admin.from("notification_deliveries").insert({ outbox_id: job.id, token_id: expoTokens[index].id, provider_ticket_id: ticket.id || null, status: ticket.status === "ok" ? "accepted" : "failed", provider_response: ticket });
+          if (invalid) await admin.from("device_push_tokens").update({ notifications_enabled: false, invalidated_at: new Date().toISOString() }).eq("id", expoTokens[index].id);
+        }
       }
       await admin.from("notification_outbox").update({ status: "sent", processed_at: new Date().toISOString(), last_error: null }).eq("id", job.id);
       accepted += 1;

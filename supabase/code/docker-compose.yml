@@ -117,6 +117,14 @@ services:
       DASHBOARD_PASSWORD: ${DASHBOARD_PASSWORD}
     entrypoint: /home/kong/kong-entrypoint.sh
 
+  mail-templates:
+    image: nginx:1.27-alpine
+    restart: unless-stopped
+    volumes:
+      - ./volumes/mail-templates:/usr/share/nginx/html:ro,Z
+    expose:
+      - "80"
+
   auth:
     image: supabase/gotrue:v2.186.0
     restart: unless-stopped
@@ -137,6 +145,8 @@ services:
       db:
         # Disable this if you are using an external Postgres database
         condition: service_healthy
+      mail-templates:
+        condition: service_started
     environment:
       GOTRUE_API_HOST: 0.0.0.0
       GOTRUE_API_PORT: 9999
@@ -176,6 +186,12 @@ services:
       GOTRUE_SMTP_USER: ${SMTP_USER}
       GOTRUE_SMTP_PASS: ${SMTP_PASS}
       GOTRUE_SMTP_SENDER_NAME: ${SMTP_SENDER_NAME}
+      GOTRUE_MAILER_OTP_LENGTH: "${MAILER_OTP_LENGTH:-6}"
+      GOTRUE_MAILER_OTP_EXP: "${MAILER_OTP_EXP:-600}"
+      GOTRUE_MAILER_TEMPLATES_RECOVERY: http://mail-templates/recovery.html
+      GOTRUE_MAILER_SUBJECTS_RECOVERY: "Código para redefinir sua senha"
+      GOTRUE_MAILER_TEMPLATES_MAGIC_LINK: http://mail-templates/account-verification.html
+      GOTRUE_MAILER_SUBJECTS_MAGIC_LINK: "Código de confirmação da sua conta"
       GOTRUE_MAILER_URLPATHS_INVITE: ${MAILER_URLPATHS_INVITE}
       GOTRUE_MAILER_URLPATHS_CONFIRMATION: ${MAILER_URLPATHS_CONFIRMATION}
       GOTRUE_MAILER_URLPATHS_RECOVERY: ${MAILER_URLPATHS_RECOVERY}
@@ -460,6 +476,8 @@ services:
       HOTMART_ROSTER_STATUSES: "${HOTMART_ROSTER_STATUSES:-ACTIVE,DELAYED,OVERDUE}"
       PUSH_WORKER_SECRET: ${PUSH_WORKER_SECRET}
       EXPO_ACCESS_TOKEN: ${EXPO_ACCESS_TOKEN:-}
+      ONESIGNAL_APP_ID: ${ONESIGNAL_APP_ID}
+      ONESIGNAL_REST_API_KEY: ${ONESIGNAL_REST_API_KEY}
     command: [ "start", "--main-service", "/home/deno/functions/main" ]
 
   analytics:
