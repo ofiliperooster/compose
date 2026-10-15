@@ -30,6 +30,13 @@ type HotmartSubscription = {
 type HotmartProduct = { id?: number | string; ucode?: string; name?: string };
 type HotmartPlan = { code?: string; name?: string };
 type CohortPlan = { cohort_number: number; plan_name: string; plan_code: string | null; product_name: string };
+type AutomaticGroup = {
+  group_id: string;
+  product_id: string;
+  product_name: string;
+  cohort_number: number;
+  name: string;
+};
 
 const DEFAULT_ACCESS_PRODUCT_NAMES = [
   "Casa de Isabel - Ensino e cuidado",
@@ -233,6 +240,75 @@ async function refreshCohortCatalog(admin: ReturnType<typeof serviceClient>, acc
   return { plans, cohorts };
 }
 
+function automaticGroupName(productName: string, cohortNumber: number) {
+  const shortName = productName.replace(/^Casa de Isabel\s*[-–—]\s*/i, "").trim() || productName;
+  return `${shortName} · Turma ${cohortNumber}`;
+}
+
+async function ensureAutomaticGroups(
+  admin: ReturnType<typeof serviceClient>,
+  userId: string,
+  catalogs: Array<{ product: { id: string; name: string }; catalog: { cohorts: number[] } }>,
+) {
+  const desired = catalogs.flatMap(({ product, catalog }) => catalog.cohorts.map((cohortNumber) => ({
+    product_id: product.id,
+    product_name: product.name,
+    cohort_number: cohortNumber,
+    name: automaticGroupName(product.name, cohortNumber),
+  })));
+  const productIds = [...new Set(desired.map((group) => group.product_id))];
+  const legacyProductId = Deno.env.get("HOTMART_PRODUCT_ID")?.trim();
+  if (legacyProductId && productIds.includes(legacyProductId)) {
+    const legacyCohorts = [...new Set(desired
+      .filter((group) => group.product_id === legacyProductId)
+      .map((group) => group.cohort_number))];
+    if (legacyCohorts.length) {
+      const { error: legacyError } = await admin
+        .from("student_groups")
+        .update({ product_id: legacyProductId })
+        .is("product_id", null)
+        .in("cohort_number", legacyCohorts);
+      if (legacyError) throw new Error(`Falha ao vincular os grupos antigos ao produto original: ${legacyError.message}`);
+    }
+  }
+  const { data: existing, error: existingError } = await admin
+    .from("student_groups")
+    .select("id,name,product_id,cohort_number")
+    .in("product_id", productIds);
+  if (existingError) throw new Error(`Falha ao consultar os grupos automáticos: ${existingError.message}`);
+
+  const byScope = new Map<string, { id: string; name: string }>();
+  for (const group of existing ?? []) {
+    const key = `${String(group.product_id)}:${Number(group.cohort_number)}`;
+    if (!byScope.has(key)) byScope.set(key, { id: String(group.id), name: String(group.name) });
+  }
+
+  const missing = desired.filter((group) => !byScope.has(`${group.product_id}:${group.cohort_number}`));
+  if (missing.length) {
+    const { data: inserted, error: insertError } = await admin.from("student_groups").insert(missing.map((group) => ({
+      name: group.name,
+      description: `Grupo criado automaticamente pela Hotmart para ${group.product_name}, Turma ${group.cohort_number}.`,
+      product_id: group.product_id,
+      cohort_number: group.cohort_number,
+      is_joinable: false,
+      created_by: userId,
+    }))).select("id,name,product_id,cohort_number");
+    if (insertError) throw new Error(`Falha ao criar os grupos automáticos: ${insertError.message}`);
+    for (const group of inserted ?? []) {
+      byScope.set(`${String(group.product_id)}:${Number(group.cohort_number)}`, {
+        id: String(group.id),
+        name: String(group.name),
+      });
+    }
+  }
+
+  return desired.map((group): AutomaticGroup => {
+    const saved = byScope.get(`${group.product_id}:${group.cohort_number}`);
+    if (!saved) throw new Error(`O grupo automático da Turma ${group.cohort_number} não foi localizado.`);
+    return { group_id: saved.id, ...group, name: saved.name };
+  });
+}
+
 async function groupCohortPlans(admin: ReturnType<typeof serviceClient>, groupId: string | null, productId: string) {
   if (!groupId) throw new Error("Selecione um grupo para sincronizar somente os alunos da turma correspondente.");
   const { data: group, error: groupError } = await admin.from("student_groups").select("cohort_number,product_id").eq("id", groupId).maybeSingle();
@@ -338,11 +414,15 @@ Deno.serve(async (req) => {
     if (requestedAction === "cohorts") {
       const accessToken = await hotmartAccessToken();
       const products = await fetchAccessProducts(accessToken);
-      const catalogs = [];
+      const catalogs: Array<{
+        product: { id: string; name: string };
+        catalog: { plans: CohortPlan[]; cohorts: number[] };
+      }> = [];
       for (const product of products) {
         const catalog = await refreshCohortCatalog(admin, accessToken, product.id, product.name);
         catalogs.push({ product, catalog });
       }
+      const groups = await ensureAutomaticGroups(admin, userId, catalogs);
       return json({
         status: "completed",
         cohorts: catalogs.flatMap(({ product, catalog }) => catalog.cohorts.map((cohort_number) => ({
@@ -353,6 +433,7 @@ Deno.serve(async (req) => {
         }))),
         plans: catalogs.reduce((total, entry) => total + entry.catalog.plans.length, 0),
         products: products.length,
+        groups,
       });
     }
 
@@ -436,11 +517,11 @@ Deno.serve(async (req) => {
     }
     const scopedRoster = targetCohort == null ? roster : roster.filter((row) => Number(row.cohort_number) === targetCohort);
     const previousActive = targetCohort == null ? previousActiveGlobal : previousCohorts.get(targetCohort) ?? 0;
-    const abnormalDrop = scopedRoster.length === 0 || (previousActive >= 10 && scopedRoster.length < Math.ceil(previousActive * 0.25));
+    const abnormalDrop = previousActive > 0 && (scopedRoster.length === 0 || (previousActive >= 10 && scopedRoster.length < Math.ceil(previousActive * 0.25)));
     const cohortEntries = targetCohort == null ? [...previousCohorts.entries()] : [[targetCohort, previousActive] as [number, number]];
     const abnormalCohorts = cohortEntries.flatMap(([cohort, previous]) => {
       const current = cohortCounts.get(cohort) ?? 0;
-      return current === 0 || (previous >= 5 && current < Math.ceil(previous * 0.25)) ? [{ cohort_number: cohort, previous, current }] : [];
+      return previous > 0 && (current === 0 || (previous >= 5 && current < Math.ceil(previous * 0.25))) ? [{ cohort_number: cohort, previous, current }] : [];
     });
     if ((abnormalDrop || abnormalCohorts.length > 0) && !input.force) {
       await admin.from("hotmart_roster_sync_runs").update({ status: "awaiting_confirmation", eligible: scopedRoster.length, updated_at: new Date().toISOString() }).eq("id", run.id);

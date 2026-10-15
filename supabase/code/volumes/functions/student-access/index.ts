@@ -188,6 +188,7 @@ async function saveEligibility(
 ) {
   const cohort = extractHotmartCohort(subscription);
   if (cohort) {
+    const resolvedProductId = String(subscription.product?.id ?? productId);
     const { error } = await admin.from("hotmart_cohort_roster").upsert({
       cohort_number: cohort.cohortNumber,
       email,
@@ -195,11 +196,22 @@ async function saveEligibility(
       external_student_id: subscription.subscriber?.ucode ?? subscription.subscriber_code ?? (subscription.subscription_id == null ? null : String(subscription.subscription_id)),
       subscription_status: subscription.status?.toUpperCase() ?? "ACTIVE",
       plan_name: subscription.plan?.name ?? null,
-      product_id: String(subscription.product?.id ?? productId),
+      product_id: resolvedProductId,
       active: true,
       synced_at: new Date().toISOString(),
     }, { onConflict: "product_id,cohort_number,email" });
     if (error) throw new Error(`Falha ao registrar elegibilidade: ${error.message}`);
+
+    const { data: groups, error: groupsError } = await admin
+      .from("student_groups")
+      .select("id")
+      .eq("product_id", resolvedProductId)
+      .eq("cohort_number", cohort.cohortNumber);
+    if (groupsError) throw new Error(`Falha ao localizar o grupo da assinatura: ${groupsError.message}`);
+    for (const group of groups ?? []) {
+      const { error: syncError } = await admin.rpc("sync_group_from_cohort_roster", { p_group_id: group.id });
+      if (syncError) throw new Error(`Falha ao vincular a aluna ao grupo: ${syncError.message}`);
+    }
   }
   return cohort;
 }
