@@ -27,9 +27,14 @@ type HotmartSubscription = {
   product?: { id?: number | string; name?: string };
   subscriber?: { name?: string; email?: string; ucode?: string };
 };
-type HotmartProduct = { id?: number | string; ucode?: string };
+type HotmartProduct = { id?: number | string; ucode?: string; name?: string };
 type HotmartPlan = { code?: string; name?: string };
-type CohortPlan = { cohort_number: number; plan_name: string; plan_code: string | null };
+type CohortPlan = { cohort_number: number; plan_name: string; plan_code: string | null; product_name: string };
+
+const DEFAULT_ACCESS_PRODUCT_NAMES = [
+  "Casa de Isabel - Ensino e cuidado",
+  "Casa de Isabel - Tornando-se uma mentora",
+];
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -116,9 +121,62 @@ function configuredStatuses() {
   return [...new Set(raw.split(",").map((value) => value.trim().toUpperCase()).filter(Boolean))];
 }
 
+function normalizedProductName(value: string) {
+  return value
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, " ")
+    .trim();
+}
+
+function configuredProductIds() {
+  const raw = [
+    Deno.env.get("HOTMART_ACCESS_PRODUCT_IDS"),
+    Deno.env.get("HOTMART_PRODUCT_IDS"),
+    Deno.env.get("HOTMART_PRODUCT_ID"),
+  ].filter(Boolean).join(",");
+  return new Set(raw.split(",").map((value) => value.trim()).filter(Boolean));
+}
+
+async function fetchAccessProducts(accessToken: string) {
+  const configuredIds = configuredProductIds();
+  const configuredNames = Deno.env.get("HOTMART_ACCESS_PRODUCT_NAMES")
+    ?.split("|")
+    .map((value) => value.trim())
+    .filter(Boolean);
+  const acceptedNames = new Set((configuredNames?.length ? configuredNames : DEFAULT_ACCESS_PRODUCT_NAMES).map(normalizedProductName));
+  const products = new Map<string, { id: string; name: string }>();
+  let pageToken: string | null = null;
+  for (let page = 0; page < 20; page += 1) {
+    const url = new URL("https://developers.hotmart.com/products/api/v1/products");
+    url.searchParams.set("max_results", "50");
+    if (pageToken) url.searchParams.set("page_token", pageToken);
+    const response = await fetchWithTimeout(url, {
+      headers: { Authorization: `Bearer ${accessToken}`, "Content-Type": "application/json" },
+    }, 20_000);
+    if (!response.ok) throw new Error(`Hotmart produtos falhou (${response.status}): ${(await response.text()).slice(0, 500)}`);
+    const payload = await response.json() as { items?: HotmartProduct[]; page_info?: { next_page_token?: string | null } };
+    for (const product of payload.items ?? []) {
+      if (product.id == null) continue;
+      const id = String(product.id);
+      const name = product.name?.trim() || `Produto ${id}`;
+      if (configuredIds.has(id) || acceptedNames.has(normalizedProductName(name))) products.set(id, { id, name });
+    }
+    pageToken = payload.page_info?.next_page_token ?? null;
+    if (!pageToken) break;
+  }
+  for (const id of configuredIds) {
+    if (!products.has(id)) products.set(id, { id, name: `Produto ${id}` });
+  }
+  if (!products.size) throw new Error("Nenhum produto de acesso da Casa de Isabel foi encontrado.");
+  return [...products.values()];
+}
+
 async function fetchProductUcode(accessToken: string, productId: string) {
   const configured = Deno.env.get("HOTMART_PRODUCT_UCODE")?.trim();
-  if (configured) return configured;
+  const legacyProductId = Deno.env.get("HOTMART_PRODUCT_ID")?.trim();
+  if (configured && legacyProductId === productId) return configured;
   const url = new URL("https://developers.hotmart.com/products/api/v1/products");
   url.searchParams.set("id", productId);
   url.searchParams.set("max_results", "50");
@@ -132,7 +190,7 @@ async function fetchProductUcode(accessToken: string, productId: string) {
   return product.ucode;
 }
 
-async function fetchCohortPlans(accessToken: string, productId: string) {
+async function fetchCohortPlans(accessToken: string, productId: string, productName: string) {
   const productUcode = await fetchProductUcode(accessToken, productId);
   const url = new URL(`https://developers.hotmart.com/products/api/v1/products/${encodeURIComponent(productUcode)}/plans`);
   url.searchParams.set("max_results", "500");
@@ -152,14 +210,15 @@ async function fetchCohortPlans(accessToken: string, productId: string) {
       cohort_number: cohort.cohortNumber,
       plan_name: planName,
       plan_code: plan.code?.trim() || null,
+      product_name: productName,
     });
   }
   if (!plans.size) throw new Error("Nenhuma turma no formato T## foi encontrada nos nomes dos planos da Hotmart.");
   return [...plans.values()];
 }
 
-async function refreshCohortCatalog(admin: ReturnType<typeof serviceClient>, accessToken: string, productId: string) {
-  const plans = await fetchCohortPlans(accessToken, productId);
+async function refreshCohortCatalog(admin: ReturnType<typeof serviceClient>, accessToken: string, productId: string, productName: string) {
+  const plans = await fetchCohortPlans(accessToken, productId, productName);
   const syncedAt = new Date().toISOString();
   const { error: deactivateError } = await admin.from("hotmart_cohort_plans").update({ active: false, synced_at: syncedAt }).eq("product_id", productId);
   if (deactivateError) throw new Error(`Falha ao atualizar o catálogo de turmas: ${deactivateError.message}`);
@@ -176,8 +235,9 @@ async function refreshCohortCatalog(admin: ReturnType<typeof serviceClient>, acc
 
 async function groupCohortPlans(admin: ReturnType<typeof serviceClient>, groupId: string | null, productId: string) {
   if (!groupId) throw new Error("Selecione um grupo para sincronizar somente os alunos da turma correspondente.");
-  const { data: group, error: groupError } = await admin.from("student_groups").select("cohort_number").eq("id", groupId).maybeSingle();
-  if (groupError || !group?.cohort_number) throw new Error("Grupo ou turma não encontrado.");
+  const { data: group, error: groupError } = await admin.from("student_groups").select("cohort_number,product_id").eq("id", groupId).maybeSingle();
+  if (groupError || !group?.cohort_number || !group.product_id) throw new Error("Grupo sem produto ou turma definidos.");
+  if (String(group.product_id) !== productId) throw new Error("O grupo pertence a outro produto da Hotmart.");
   const cohortNumber = Number(group.cohort_number);
   const { data: plans, error: plansError } = await admin.from("hotmart_cohort_plans").select("plan_name").eq("product_id", productId).eq("cohort_number", cohortNumber).eq("active", true);
   if (plansError) throw new Error(`Falha ao consultar os planos da turma: ${plansError.message}`);
@@ -276,16 +336,23 @@ Deno.serve(async (req) => {
     if (!new Set(["sync", "cohorts"]).has(requestedAction)) return json({ error: "invalid_action" }, 400);
 
     if (requestedAction === "cohorts") {
-      const productId = requiredEnv("HOTMART_PRODUCT_ID");
       const accessToken = await hotmartAccessToken();
-      const catalog = await refreshCohortCatalog(admin, accessToken, productId);
+      const products = await fetchAccessProducts(accessToken);
+      const catalogs = [];
+      for (const product of products) {
+        const catalog = await refreshCohortCatalog(admin, accessToken, product.id, product.name);
+        catalogs.push({ product, catalog });
+      }
       return json({
         status: "completed",
-        cohorts: catalog.cohorts.map((cohort_number) => ({
+        cohorts: catalogs.flatMap(({ product, catalog }) => catalog.cohorts.map((cohort_number) => ({
+          product_id: product.id,
+          product_name: product.name,
           cohort_number,
           plan_count: catalog.plans.filter((plan) => plan.cohort_number === cohort_number).length,
-        })),
-        plans: catalog.plans.length,
+        }))),
+        plans: catalogs.reduce((total, entry) => total + entry.catalog.plans.length, 0),
+        products: products.length,
       });
     }
 
@@ -295,8 +362,10 @@ Deno.serve(async (req) => {
       if (error || !data) return json({ error: "sync_run_not_found", message: "Sincronização não encontrada ou expirada." }, 404);
       run = data as SyncRun;
     } else {
-      const productId = requiredEnv("HOTMART_PRODUCT_ID");
       if (!input.group_id) return json({ error: "group_required", message: "Selecione um grupo para sincronizar os alunos da turma." }, 400);
+      const { data: targetGroup, error: targetGroupError } = await admin.from("student_groups").select("product_id").eq("id", input.group_id).maybeSingle();
+      if (targetGroupError || !targetGroup?.product_id) return json({ error: "group_product_required", message: "Defina o produto da Hotmart deste grupo." }, 400);
+      const productId = String(targetGroup.product_id);
       await admin.from("hotmart_roster_sync_runs").delete().eq("requested_by", userId).lt("started_at", new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString());
       const { data, error } = await admin.from("hotmart_roster_sync_runs").insert({
         requested_by: userId,

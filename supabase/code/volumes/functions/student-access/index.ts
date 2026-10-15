@@ -15,8 +15,8 @@ type HotmartProduct = {
   name?: string;
 };
 type EligibilityLookup = {
-  subscription: HotmartSubscription | null;
-  productId: string;
+  matches: Array<{ subscription: HotmartSubscription; productId: string }>;
+  productIds: string[];
   source: "hotmart";
 };
 
@@ -77,7 +77,12 @@ async function hotmartAccessToken() {
 }
 
 function normalizedProductName(value: string) {
-  return value.normalize("NFD").replace(/[\u0300-\u036f]/g, "").trim().toLowerCase();
+  return value
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, " ")
+    .trim();
 }
 
 function configuredProductIds() {
@@ -130,6 +135,7 @@ async function accessProductIds(accessToken: string) {
 async function liveEligibleSubscription(email: string): Promise<EligibilityLookup> {
   const accessToken = await hotmartAccessToken();
   const productIds = await accessProductIds(accessToken);
+  const matches: EligibilityLookup["matches"] = [];
   for (const productId of productIds) {
     let pageToken: string | null = null;
     for (let page = 0; page < 10; page += 1) {
@@ -152,12 +158,15 @@ async function liveEligibleSubscription(email: string): Promise<EligibilityLooku
         item.subscriber?.email?.trim().toLowerCase() === email &&
         ACCESS_STATUSES.includes((item.status?.toUpperCase() ?? "") as typeof ACCESS_STATUSES[number])
       );
-      if (eligible) return { subscription: eligible, productId, source: "hotmart" as const };
+      if (eligible) {
+        matches.push({ subscription: eligible, productId });
+        break;
+      }
       pageToken = payload.page_info?.next_page_token ?? null;
       if (!pageToken) break;
     }
   }
-  return { subscription: null, productId: productIds[0], source: "hotmart" as const };
+  return { matches, productIds, source: "hotmart" as const };
 }
 
 async function authenticatedUser(req: Request): Promise<User | null> {
@@ -189,10 +198,54 @@ async function saveEligibility(
       product_id: String(subscription.product?.id ?? productId),
       active: true,
       synced_at: new Date().toISOString(),
-    }, { onConflict: "cohort_number,email" });
+    }, { onConflict: "product_id,cohort_number,email" });
     if (error) throw new Error(`Falha ao registrar elegibilidade: ${error.message}`);
   }
   return cohort;
+}
+
+async function revokeIneligibleProductAccess(
+  admin: ReturnType<typeof serviceClient>,
+  email: string,
+  allProductIds: string[],
+  eligibleProductIds: string[],
+  currentUser: User | null,
+) {
+  const eligible = new Set(eligibleProductIds);
+  const ineligibleProductIds = allProductIds.filter((productId) => !eligible.has(productId));
+  if (!ineligibleProductIds.length) return;
+
+  const syncedAt = new Date().toISOString();
+  const { error: rosterError } = await admin
+    .from("hotmart_cohort_roster")
+    .update({ active: false, synced_at: syncedAt })
+    .eq("email", email)
+    .in("product_id", ineligibleProductIds);
+  if (rosterError) throw new Error(`Falha ao revogar produto sem assinatura: ${rosterError.message}`);
+
+  const { data: groups, error: groupsError } = await admin
+    .from("student_groups")
+    .select("id")
+    .in("product_id", ineligibleProductIds);
+  if (groupsError) throw new Error(`Falha ao consultar grupos por produto: ${groupsError.message}`);
+  const groupIds = (groups ?? []).map((group) => String(group.id));
+  if (!groupIds.length) return;
+
+  const { error: invitationsError } = await admin
+    .from("student_group_invitations")
+    .update({ status: "inactive", matched_user_id: null, matched_at: null })
+    .eq("email", email)
+    .in("group_id", groupIds);
+  if (invitationsError) throw new Error(`Falha ao revogar convites por produto: ${invitationsError.message}`);
+
+  if (currentUser) {
+    const { error: membershipsError } = await admin
+      .from("student_group_members")
+      .delete()
+      .eq("user_id", currentUser.id)
+      .in("group_id", groupIds);
+    if (membershipsError) throw new Error(`Falha ao revogar grupos por produto: ${membershipsError.message}`);
+  }
 }
 
 async function activateProfile(
@@ -236,22 +289,39 @@ Deno.serve(async (req) => {
       return json({ error: "hotmart_unavailable", message: "Não foi possível confirmar a assinatura na Hotmart." }, 503);
     }
 
-    if (!lookup.subscription) {
+    if (!lookup.matches.length) {
+      await revokeIneligibleProductAccess(admin, email, lookup.productIds, [], currentUser);
       if (currentUser) await admin.from("profiles").update({ subscription_status: "inactive" }).eq("id", currentUser.id);
       return json({ error: "subscription_not_eligible", message: "Assinatura sem acesso liberado." }, 403);
     }
 
-    const cohort = await saveEligibility(admin, email, lookup.subscription, lookup.productId);
+    const saved = await Promise.all(lookup.matches.map(async (match) => ({
+      ...match,
+      cohort: await saveEligibility(admin, email, match.subscription, match.productId),
+    })));
+    await revokeIneligibleProductAccess(
+      admin,
+      email,
+      lookup.productIds,
+      saved.map((match) => match.productId),
+      currentUser,
+    );
+    const primary = saved[0];
     if (currentUser) {
-      await activateProfile(admin, currentUser, lookup.subscription, cohort?.cohortNumber ?? null);
-      return json({ status: "validated", source: lookup.source });
+      await activateProfile(admin, currentUser, primary.subscription, primary.cohort?.cohortNumber ?? null);
+      return json({
+        status: "validated",
+        source: lookup.source,
+        product_ids: saved.map((match) => match.productId),
+      });
     }
 
     return json({
       status: "eligible",
       source: lookup.source,
-      full_name: lookup.subscription.subscriber?.name?.trim() || email.split("@")[0],
-      cohort_number: cohort?.cohortNumber ?? null,
+      full_name: primary.subscription.subscriber?.name?.trim() || email.split("@")[0],
+      cohort_number: primary.cohort?.cohortNumber ?? null,
+      product_ids: saved.map((match) => match.productId),
     });
   } catch (error) {
     console.error("student-access", error);
