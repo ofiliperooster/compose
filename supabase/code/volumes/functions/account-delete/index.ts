@@ -34,6 +34,9 @@ Deno.serve(async (req) => {
     await removeAvatarFiles(admin, user.id).catch(() => undefined);
     await admin.from("student_group_invitations").delete().ilike("email", user.email);
     await admin.from("hotmart_cohort_roster").delete().ilike("email", user.email);
+    // Moderation snapshots use SET NULL so staff can normally retain an audit
+    // trail. A user-requested account deletion removes that authored content.
+    await admin.from("moderation_events").delete().eq("sender_id", user.id);
     const { error: deleteError } = await admin.auth.admin.deleteUser(user.id, false);
     if (deleteError) throw deleteError;
     return json({ status: "deleted" });

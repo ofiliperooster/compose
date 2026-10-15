@@ -27,6 +27,9 @@ type HotmartSubscription = {
   product?: { id?: number | string; name?: string };
   subscriber?: { name?: string; email?: string; ucode?: string };
 };
+type HotmartProduct = { id?: number | string; ucode?: string };
+type HotmartPlan = { code?: string; name?: string };
+type CohortPlan = { cohort_number: number; plan_name: string; plan_code: string | null };
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -41,6 +44,12 @@ function requiredEnv(name: string) {
   const value = Deno.env.get(name)?.trim();
   if (!value) throw new Error(`${name} não configurada`);
   return value;
+}
+
+function integerEnv(name: string, fallback: number, minimum: number, maximum: number) {
+  const parsed = Number.parseInt(Deno.env.get(name)?.trim() || "", 10);
+  if (!Number.isFinite(parsed)) return fallback;
+  return Math.min(maximum, Math.max(minimum, parsed));
 }
 
 function serviceClient() {
@@ -107,17 +116,88 @@ function configuredStatuses() {
   return [...new Set(raw.split(",").map((value) => value.trim().toUpperCase()).filter(Boolean))];
 }
 
-async function fetchSubscriptionPage(accessToken: string, productId: string, pageToken?: string) {
+async function fetchProductUcode(accessToken: string, productId: string) {
+  const configured = Deno.env.get("HOTMART_PRODUCT_UCODE")?.trim();
+  if (configured) return configured;
+  const url = new URL("https://developers.hotmart.com/products/api/v1/products");
+  url.searchParams.set("id", productId);
+  url.searchParams.set("max_results", "50");
+  const response = await fetchWithTimeout(url, {
+    headers: { Authorization: `Bearer ${accessToken}`, "Content-Type": "application/json" },
+  }, 20_000);
+  if (!response.ok) throw new Error(`Hotmart produtos falhou (${response.status}): ${(await response.text()).slice(0, 500)}`);
+  const payload = await response.json() as { items?: HotmartProduct[] };
+  const product = (payload.items ?? []).find((item) => String(item.id ?? "") === productId) ?? payload.items?.[0];
+  if (!product?.ucode) throw new Error("A Hotmart não retornou o identificador UUID do produto.");
+  return product.ucode;
+}
+
+async function fetchCohortPlans(accessToken: string, productId: string) {
+  const productUcode = await fetchProductUcode(accessToken, productId);
+  const url = new URL(`https://developers.hotmart.com/products/api/v1/products/${encodeURIComponent(productUcode)}/plans`);
+  url.searchParams.set("max_results", "500");
+  const response = await fetchWithTimeout(url, {
+    headers: { Authorization: `Bearer ${accessToken}`, "Content-Type": "application/json" },
+  }, 20_000);
+  if (!response.ok) throw new Error(`Hotmart planos falhou (${response.status}): ${(await response.text()).slice(0, 500)}`);
+  const payload = await response.json() as { items?: HotmartPlan[]; page_info?: { next_page_token?: string | null } };
+  if (payload.page_info?.next_page_token) throw new Error("O produto possui mais de 500 planos. Contate o suporte para ampliar a paginação do catálogo.");
+  const plans = new Map<string, CohortPlan>();
+  for (const plan of payload.items ?? []) {
+    const planName = plan.name?.trim();
+    if (!planName) continue;
+    const cohort = extractHotmartCohort({ plan: { name: planName } });
+    if (!cohort) continue;
+    plans.set(planName, {
+      cohort_number: cohort.cohortNumber,
+      plan_name: planName,
+      plan_code: plan.code?.trim() || null,
+    });
+  }
+  if (!plans.size) throw new Error("Nenhuma turma no formato T## foi encontrada nos nomes dos planos da Hotmart.");
+  return [...plans.values()];
+}
+
+async function refreshCohortCatalog(admin: ReturnType<typeof serviceClient>, accessToken: string, productId: string) {
+  const plans = await fetchCohortPlans(accessToken, productId);
+  const syncedAt = new Date().toISOString();
+  const { error: deactivateError } = await admin.from("hotmart_cohort_plans").update({ active: false, synced_at: syncedAt }).eq("product_id", productId);
+  if (deactivateError) throw new Error(`Falha ao atualizar o catálogo de turmas: ${deactivateError.message}`);
+  const { error: upsertError } = await admin.from("hotmart_cohort_plans").upsert(plans.map((plan) => ({
+    product_id: productId,
+    ...plan,
+    active: true,
+    synced_at: syncedAt,
+  })), { onConflict: "product_id,plan_name" });
+  if (upsertError) throw new Error(`Falha ao salvar as turmas da Hotmart: ${upsertError.message}`);
+  const cohorts = [...new Set(plans.map((plan) => plan.cohort_number))].sort((left, right) => left - right);
+  return { plans, cohorts };
+}
+
+async function groupCohortPlans(admin: ReturnType<typeof serviceClient>, groupId: string | null, productId: string) {
+  if (!groupId) throw new Error("Selecione um grupo para sincronizar somente os alunos da turma correspondente.");
+  const { data: group, error: groupError } = await admin.from("student_groups").select("cohort_number").eq("id", groupId).maybeSingle();
+  if (groupError || !group?.cohort_number) throw new Error("Grupo ou turma não encontrado.");
+  const cohortNumber = Number(group.cohort_number);
+  const { data: plans, error: plansError } = await admin.from("hotmart_cohort_plans").select("plan_name").eq("product_id", productId).eq("cohort_number", cohortNumber).eq("active", true);
+  if (plansError) throw new Error(`Falha ao consultar os planos da turma: ${plansError.message}`);
+  const planNames = [...new Set((plans ?? []).map((plan) => String(plan.plan_name).trim()).filter(Boolean))];
+  if (!planNames.length) throw new Error(`A Turma ${cohortNumber} não está no catálogo atual. Clique em “Atualizar turmas” antes de sincronizar os alunos.`);
+  return { cohortNumber, planNames };
+}
+
+async function fetchSubscriptionPage(accessToken: string, productId: string, planNames: string[], pageToken?: string) {
   const statuses = configuredStatuses();
   const url = new URL("https://developers.hotmart.com/payments/api/v1/subscriptions");
   url.searchParams.set("product_id", productId);
-  url.searchParams.set("max_results", "500");
+  url.searchParams.set("max_results", String(integerEnv("HOTMART_ROSTER_PAGE_SIZE", 100, 25, 200)));
   url.searchParams.set("accession_date", Deno.env.get("HOTMART_ROSTER_ACCESSION_DATE")?.trim() || "0");
   for (const status of statuses) url.searchParams.append("status", status);
+  for (const planName of planNames) url.searchParams.append("plan", planName);
   if (pageToken) url.searchParams.set("page_token", pageToken);
   const response = await fetchWithTimeout(url, {
     headers: { Authorization: `Bearer ${accessToken}`, "Content-Type": "application/json" },
-  });
+  }, integerEnv("HOTMART_REQUEST_TIMEOUT_MS", 35_000, 10_000, 40_000));
   if (!response.ok) throw new Error(`Hotmart subscriptions falhou (${response.status}): ${(await response.text()).slice(0, 500)}`);
   const payload = await response.json() as { items?: HotmartSubscription[]; page_info?: { next_page_token?: string | null } };
   return { items: payload.items ?? [], nextPageToken: payload.page_info?.next_page_token || null, statuses };
@@ -195,6 +275,20 @@ Deno.serve(async (req) => {
     const requestedAction = input.action ?? "sync";
     if (!new Set(["sync", "cohorts"]).has(requestedAction)) return json({ error: "invalid_action" }, 400);
 
+    if (requestedAction === "cohorts") {
+      const productId = requiredEnv("HOTMART_PRODUCT_ID");
+      const accessToken = await hotmartAccessToken();
+      const catalog = await refreshCohortCatalog(admin, accessToken, productId);
+      return json({
+        status: "completed",
+        cohorts: catalog.cohorts.map((cohort_number) => ({
+          cohort_number,
+          plan_count: catalog.plans.filter((plan) => plan.cohort_number === cohort_number).length,
+        })),
+        plans: catalog.plans.length,
+      });
+    }
+
     let run: SyncRun;
     if (input.run_id) {
       const { data, error } = await admin.from("hotmart_roster_sync_runs").select("*").eq("id", input.run_id).eq("requested_by", userId).maybeSingle();
@@ -202,6 +296,7 @@ Deno.serve(async (req) => {
       run = data as SyncRun;
     } else {
       const productId = requiredEnv("HOTMART_PRODUCT_ID");
+      if (!input.group_id) return json({ error: "group_required", message: "Selecione um grupo para sincronizar os alunos da turma." }, 400);
       await admin.from("hotmart_roster_sync_runs").delete().eq("requested_by", userId).lt("started_at", new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString());
       const { data, error } = await admin.from("hotmart_roster_sync_runs").insert({
         requested_by: userId,
@@ -221,10 +316,11 @@ Deno.serve(async (req) => {
       if (run.pages >= 500) throw new Error("A Hotmart excedeu o limite seguro de 500 páginas. Revise o produto e os filtros.");
       const currentToken = run.pages > 0 ? run.next_page_token || undefined : undefined;
       if (currentToken && run.seen_page_tokens.includes(currentToken)) throw new Error("A Hotmart repetiu o cursor de paginação e a sincronização foi interrompida com segurança.");
+      const cohort = await groupCohortPlans(admin, run.group_id, run.product_id);
       const accessToken = await hotmartAccessToken();
-      const page = await fetchSubscriptionPage(accessToken, run.product_id, currentToken);
+      const page = await fetchSubscriptionPage(accessToken, run.product_id, cohort.planNames, currentToken);
       const syncedAt = new Date().toISOString();
-      const pageRoster = buildRoster(page.items, run.product_id, syncedAt);
+      const pageRoster = buildRoster(page.items, run.product_id, syncedAt).filter((row) => Number(row.cohort_number) === cohort.cohortNumber);
       if (pageRoster.length) {
         const { error } = await admin.from("hotmart_roster_sync_rows").upsert(pageRoster.map((payload) => ({
           run_id: run.id,
@@ -258,12 +354,6 @@ Deno.serve(async (req) => {
     const cohortCounts = new Map<number, number>();
     for (const row of roster) cohortCounts.set(Number(row.cohort_number), (cohortCounts.get(Number(row.cohort_number)) ?? 0) + 1);
     const cohorts = [...cohortCounts.entries()].sort(([left], [right]) => left - right).map(([cohort_number, student_count]) => ({ cohort_number, student_count }));
-    if (run.action === "cohorts") {
-      await admin.from("hotmart_roster_sync_runs").update({ status: "completed", eligible: roster.length, completed_at: new Date().toISOString(), updated_at: new Date().toISOString() }).eq("id", run.id);
-      await admin.from("hotmart_roster_sync_rows").delete().eq("run_id", run.id);
-      return json({ status: "completed", run_id: run.id, cohorts, fetched: run.fetched, eligible: roster.length, statuses: configuredStatuses() });
-    }
-
     const [previousActiveGlobal, previousCohorts] = await Promise.all([
       activeRosterCount(admin, run.product_id),
       activeRosterCohortCounts(admin, run.product_id),
