@@ -19,6 +19,12 @@ type EligibilityLookup = {
   productIds: string[];
   source: "hotmart";
 };
+type ManualAccessGrant = {
+  email: string;
+  product_id: string;
+  cohort_number: number;
+  full_name: string | null;
+};
 
 const ACCESS_STATUSES = ["ACTIVE", "DELAYED", "OVERDUE"] as const;
 const DEFAULT_ACCESS_PRODUCT_NAMES = [
@@ -180,6 +186,38 @@ async function authenticatedUser(req: Request): Promise<User | null> {
   return error ? null : data.user;
 }
 
+async function manualAccessGrants(
+  admin: ReturnType<typeof serviceClient>,
+  email: string,
+): Promise<ManualAccessGrant[]> {
+  const { data, error } = await admin
+    .from("manual_access_grants")
+    .select("email,product_id,cohort_number,full_name")
+    .eq("email", email)
+    .eq("active", true)
+    .order("updated_at", { ascending: false });
+  if (error) throw new Error(`Falha ao consultar liberação manual: ${error.message}`);
+  return (data ?? []) as ManualAccessGrant[];
+}
+
+async function activateManualProfile(
+  admin: ReturnType<typeof serviceClient>,
+  user: User,
+  grant: ManualAccessGrant,
+) {
+  const { data: profile, error: profileError } = await admin.from("profiles").select("id").eq("id", user.id).maybeSingle();
+  if (profileError) throw new Error(profileError.message);
+  const values = {
+    full_name: grant.full_name?.trim() || user.user_metadata?.full_name || user.email?.split("@")[0] || "Aluno(a)",
+    subscription_status: "active",
+    cohort_number: grant.cohort_number,
+  };
+  const response = profile
+    ? await admin.from("profiles").update(values).eq("id", user.id)
+    : await admin.from("profiles").insert({ id: user.id, role: "student", ...values });
+  if (response.error) throw new Error(`Falha ao liberar o perfil manual: ${response.error.message}`);
+}
+
 async function saveEligibility(
   admin: ReturnType<typeof serviceClient>,
   email: string,
@@ -292,6 +330,26 @@ Deno.serve(async (req) => {
     const currentUser = await authenticatedUser(req);
     if (currentUser?.email?.trim().toLowerCase() !== email && currentUser) {
       return json({ error: "email_mismatch", message: "O e-mail não corresponde à sessão atual." }, 403);
+    }
+
+    const manualGrants = await manualAccessGrants(admin, email);
+    if (manualGrants.length) {
+      const primary = manualGrants[0];
+      if (currentUser) {
+        await activateManualProfile(admin, currentUser, primary);
+        return json({
+          status: "validated",
+          source: "manual",
+          product_ids: manualGrants.map((grant) => grant.product_id),
+        });
+      }
+      return json({
+        status: "eligible",
+        source: "manual",
+        full_name: primary.full_name?.trim() || email.split("@")[0],
+        cohort_number: primary.cohort_number,
+        product_ids: manualGrants.map((grant) => grant.product_id),
+      });
     }
 
     let lookup: EligibilityLookup;
