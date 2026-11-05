@@ -148,6 +148,8 @@ services:
       mail-templates:
         condition: service_started
     environment:
+      
+    environment:
       GOTRUE_API_HOST: 0.0.0.0
       GOTRUE_API_PORT: 9999
       API_EXTERNAL_URL: ${API_EXTERNAL_URL}
@@ -163,47 +165,50 @@ services:
       GOTRUE_JWT_AUD: authenticated
       GOTRUE_JWT_DEFAULT_GROUP_NAME: authenticated
       GOTRUE_JWT_EXP: ${JWT_EXPIRY}
-
-      # Legacy symmetric HS256 key
       GOTRUE_JWT_SECRET: ${JWT_SECRET}
 
-      # JSON array of signing JWKs (EC private + legacy symmetric)
-      # For Podman, use: GOTRUE_JWT_KEYS: ${JWT_KEYS}
-      #GOTRUE_JWT_KEYS: ${JWT_KEYS:-[]}
-
+      # Autenticacao
       GOTRUE_EXTERNAL_EMAIL_ENABLED: ${ENABLE_EMAIL_SIGNUP}
       GOTRUE_EXTERNAL_ANONYMOUS_USERS_ENABLED: ${ENABLE_ANONYMOUS_USERS}
       GOTRUE_MAILER_AUTOCONFIRM: ${ENABLE_EMAIL_AUTOCONFIRM}
 
-      # Uncomment to bypass nonce check in ID Token flow. Commonly set to true when using Google Sign In on mobile.
-      # GOTRUE_EXTERNAL_SKIP_NONCE_CHECK: "true"
-
-      # GOTRUE_MAILER_SECURE_EMAIL_CHANGE_ENABLED: "true"
-      # GOTRUE_SMTP_MAX_FREQUENCY: 1s
+      # SMTP
       GOTRUE_SMTP_ADMIN_EMAIL: ${SMTP_ADMIN_EMAIL}
       GOTRUE_SMTP_HOST: ${SMTP_HOST}
       GOTRUE_SMTP_PORT: ${SMTP_PORT}
       GOTRUE_SMTP_USER: ${SMTP_USER}
       GOTRUE_SMTP_PASS: ${SMTP_PASS}
       GOTRUE_SMTP_SENDER_NAME: ${SMTP_SENDER_NAME}
+
       GOTRUE_MAILER_OTP_LENGTH: "${MAILER_OTP_LENGTH:-6}"
       GOTRUE_MAILER_OTP_EXP: "${MAILER_OTP_EXP:-600}"
+
+      # 1. Recuperacao de senha
       GOTRUE_MAILER_TEMPLATES_RECOVERY: http://mail-templates/recovery.html
       GOTRUE_MAILER_SUBJECTS_RECOVERY: "Código para redefinir sua senha"
-      GOTRUE_MAILER_TEMPLATES_MAGIC_LINK: http://mail-templates/account-verification.html
-      GOTRUE_MAILER_SUBJECTS_MAGIC_LINK: "Código de confirmação da sua conta"
+
+      # 2. Convite para novos usuarios e administradores
+      GOTRUE_MAILER_TEMPLATES_INVITE: http://mail-templates/account-verification.html
+      GOTRUE_MAILER_SUBJECTS_INVITE: "Crie seu acesso à Casa de Isabel"
+
+      # 3. Confirmacao de cadastro
+      GOTRUE_MAILER_TEMPLATES_CONFIRMATION: ${MAILER_TEMPLATES_CONFIRMATION}
+      GOTRUE_MAILER_SUBJECTS_CONFIRMATION: ${MAILER_SUBJECTS_CONFIRMATION}
+
+      # 4. Magic Link / OTP
+      GOTRUE_MAILER_TEMPLATES_MAGIC_LINK: ${MAILER_TEMPLATES_MAGIC_LINK:-}
+      GOTRUE_MAILER_SUBJECTS_MAGIC_LINK: ${MAILER_SUBJECTS_MAGIC_LINK:-}
+
+      # URLs de autenticacao
       GOTRUE_MAILER_URLPATHS_INVITE: ${MAILER_URLPATHS_INVITE}
       GOTRUE_MAILER_URLPATHS_CONFIRMATION: ${MAILER_URLPATHS_CONFIRMATION}
       GOTRUE_MAILER_URLPATHS_RECOVERY: ${MAILER_URLPATHS_RECOVERY}
       GOTRUE_MAILER_URLPATHS_EMAIL_CHANGE: ${MAILER_URLPATHS_EMAIL_CHANGE}
 
+      # Autenticacao por telefone
       GOTRUE_EXTERNAL_PHONE_ENABLED: ${ENABLE_PHONE_SIGNUP}
       GOTRUE_SMS_AUTOCONFIRM: ${ENABLE_PHONE_AUTOCONFIRM}
 
-      GOTRUE_MAILER_TEMPLATES_MAGIC_LINK: ${MAILER_TEMPLATES_MAGIC_LINK}
-      GOTRUE_MAILER_SUBJECTS_MAGIC_LINK: ${MAILER_SUBJECTS_MAGIC_LINK}
-      GOTRUE_MAILER_TEMPLATES_CONFIRMATION: ${MAILER_TEMPLATES_CONFIRMATION}
-      GOTRUE_MAILER_SUBJECTS_CONFIRMATION: ${MAILER_SUBJECTS_CONFIRMATION}
       # Uncomment to enable OAuth / social login providers.
       # GOTRUE_EXTERNAL_GOOGLE_ENABLED: ${GOOGLE_ENABLED}
       # GOTRUE_EXTERNAL_GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID}
