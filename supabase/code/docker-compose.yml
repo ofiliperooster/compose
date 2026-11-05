@@ -194,8 +194,8 @@ services:
       GOTRUE_MAILER_SUBJECTS_RECOVERY: "Código para redefinir sua senha"
 
       #Primeiro acesso OTP
-      GOTRUE_MAILER_TEMPLATES_MAGIC_LINK: http://mail-templates/account-verification.html
-      GOTRUE_MAILER_SUBJECTS_MAGIC_LINK: "Código de confirmação da sua conta"
+      GOTRUE_MAILER_TEMPLATES_MAGIC_LINK: https://painel.casadeisabel.com.br/mail/magic-link-template.html
+      GOTRUE_MAILER_SUBJECTS_MAGIC_LINK: "Crie sua senha - Casa de Isabel"
       
       GOTRUE_MAILER_URLPATHS_INVITE: ${MAILER_URLPATHS_INVITE}
       GOTRUE_MAILER_URLPATHS_CONFIRMATION: ${MAILER_URLPATHS_CONFIRMATION}
@@ -206,11 +206,11 @@ services:
       GOTRUE_SMS_AUTOCONFIRM: ${ENABLE_PHONE_AUTOCONFIRM}
 
       #Confirmação de cadastro
-      GOTRUE_MAILER_TEMPLATES_CONFIRMATION: http://mail-templates/account-verification.html
+      GOTRUE_MAILER_TEMPLATES_CONFIRMATION: https://painel.casadeisabel.com.br/mail/confirmation-template.html
       GOTRUE_MAILER_SUBJECTS_CONFIRMATION: "Confirme seu e-mail - Casa de Isabel"
 
       # Convite administrativo
-      GOTRUE_MAILER_TEMPLATES_INVITE: http://mail-templates/account-verification.html
+      GOTRUE_MAILER_TEMPLATES_INVITE: https://painel.casadeisabel.com.br/mail/magic-link-template.html
       GOTRUE_MAILER_SUBJECTS_INVITE: "Crie seu acesso à Casa de Isabel"
 
       # Uncomment to enable OAuth / social login providers.
