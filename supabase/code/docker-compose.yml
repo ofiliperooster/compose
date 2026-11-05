@@ -148,8 +148,6 @@ services:
       mail-templates:
         condition: service_started
     environment:
-      
-    environment:
       GOTRUE_API_HOST: 0.0.0.0
       GOTRUE_API_PORT: 9999
       API_EXTERNAL_URL: ${API_EXTERNAL_URL}
