@@ -23,18 +23,44 @@ type HotmartSubscription = {
   subscriber_code?: string;
   subscription_id?: number | string;
   status?: string;
-  plan?: { name?: string; id?: number | string };
+  accession_date?: number | string;
+  end_accession_date?: number | string;
+  date_next_charge?: number | string;
+  plan?: { name?: string; id?: number | string; recurrency_period?: number; max_charge_cycles?: number };
+  offer?: { code?: string };
   product?: { id?: number | string; name?: string };
   subscriber?: { name?: string; email?: string; ucode?: string };
 };
+
+function hotmartDate(value: number | string | undefined) {
+  if (value == null || value === "") return null;
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric) || numeric <= 0) return null;
+  const milliseconds = numeric < 10_000_000_000 ? numeric * 1000 : numeric;
+  const date = new Date(milliseconds);
+  return Number.isNaN(date.getTime()) ? null : date.toISOString().slice(0, 10);
+}
+
+function subscriptionPeriod(subscription: HotmartSubscription) {
+  const startedAt = hotmartDate(subscription.accession_date);
+  let expiresAt = hotmartDate(subscription.end_accession_date);
+  if (!expiresAt && startedAt && subscription.plan?.recurrency_period && subscription.plan?.max_charge_cycles) {
+    const calculated = new Date(`${startedAt}T12:00:00Z`);
+    calculated.setUTCDate(calculated.getUTCDate() + subscription.plan.recurrency_period * subscription.plan.max_charge_cycles);
+    expiresAt = calculated.toISOString().slice(0, 10);
+  }
+  if (!expiresAt) expiresAt = hotmartDate(subscription.date_next_charge);
+  return { startedAt, expiresAt };
+}
 type HotmartProduct = { id?: number | string; ucode?: string; name?: string };
 type HotmartPlan = { code?: string; name?: string };
-type CohortPlan = { cohort_number: number; plan_name: string; plan_code: string | null; product_name: string };
+type CohortPlan = { cohort_number: number; cohort_name: string | null; plan_name: string; plan_code: string | null; product_name: string };
 type AutomaticGroup = {
   group_id: string;
   product_id: string;
   product_name: string;
   cohort_number: number;
+  cohort_name: string | null;
   name: string;
 };
 
@@ -199,28 +225,75 @@ async function fetchProductUcode(accessToken: string, productId: string) {
 
 async function fetchCohortPlans(accessToken: string, productId: string, productName: string) {
   const productUcode = await fetchProductUcode(accessToken, productId);
-  const url = new URL(`https://developers.hotmart.com/products/api/v1/products/${encodeURIComponent(productUcode)}/plans`);
-  url.searchParams.set("max_results", "500");
-  const response = await fetchWithTimeout(url, {
-    headers: { Authorization: `Bearer ${accessToken}`, "Content-Type": "application/json" },
-  }, 20_000);
-  if (!response.ok) throw new Error(`Hotmart planos falhou (${response.status}): ${(await response.text()).slice(0, 500)}`);
-  const payload = await response.json() as { items?: HotmartPlan[]; page_info?: { next_page_token?: string | null } };
-  if (payload.page_info?.next_page_token) throw new Error("O produto possui mais de 500 planos. Contate o suporte para ampliar a paginação do catálogo.");
+  const plansByName = new Map<string, HotmartPlan>();
+  const seenTokens = new Set<string>();
+  let pageToken: string | null = null;
+  for (let page = 0; page < 20; page += 1) {
+    const url = new URL(`https://developers.hotmart.com/products/api/v1/products/${encodeURIComponent(productUcode)}/plans`);
+    url.searchParams.set("max_results", "500");
+    if (pageToken) url.searchParams.set("page_token", pageToken);
+    const response = await fetchWithTimeout(url, {
+      headers: { Authorization: `Bearer ${accessToken}`, "Content-Type": "application/json" },
+    }, 20_000);
+    if (!response.ok) throw new Error(`Hotmart planos falhou (${response.status}): ${(await response.text()).slice(0, 500)}`);
+    const payload = await response.json() as { items?: HotmartPlan[]; page_info?: { next_page_token?: string | null } };
+    for (const plan of payload.items ?? []) if (plan.name?.trim()) plansByName.set(plan.name.trim(), plan);
+    const next = payload.page_info?.next_page_token?.trim() || null;
+    if (!next) break;
+    if (next === pageToken || seenTokens.has(next)) throw new Error("A Hotmart repetiu o cursor ao consultar os planos do produto.");
+    seenTokens.add(next);
+    pageToken = next;
+    if (page === 19) throw new Error("O catálogo da Hotmart excedeu 10.000 planos e não foi concluído.");
+  }
   const plans = new Map<string, CohortPlan>();
-  for (const plan of payload.items ?? []) {
+  for (const plan of plansByName.values()) {
     const planName = plan.name?.trim();
     if (!planName) continue;
     const cohort = extractHotmartCohort({ plan: { name: planName } });
     if (!cohort) continue;
     plans.set(planName, {
       cohort_number: cohort.cohortNumber,
+      cohort_name: cohort.cohortName,
       plan_name: planName,
       plan_code: plan.code?.trim() || null,
       product_name: productName,
     });
   }
-  if (!plans.size) throw new Error("Nenhuma turma no formato T## foi encontrada nos nomes dos planos da Hotmart.");
+  // Some labels in the Hotmart panel are offer names, not subscription plan names.
+  const namedOffers = new Set([
+    "Plano Anual | FASE 2",
+    "Plano Mensal | Especial | Setembro 2024",
+    "Plano Semestral | Especial | Setembro 2024",
+    "Plano Anual | Especial | Setembro 2024",
+    "REC_Plano Anual | Especial | Setembro 2024",
+    "Plano Anual | Especial | Setembro 2026",
+    "REC_Plano Anual | Especial | Setembro 2026",
+  ].map((name) => name.toLowerCase()));
+  seenTokens.clear();
+  pageToken = null;
+  for (let page = 0; page < 100; page += 1) {
+    const url = new URL("https://developers.hotmart.com/products/api/v1/products/" + encodeURIComponent(productUcode) + "/offers");
+    url.searchParams.set("max_results", "100");
+    if (pageToken) url.searchParams.set("page_token", pageToken);
+    const response = await fetchWithTimeout(url, { headers: { Authorization: "Bearer " + accessToken } }, 20_000);
+    if (!response.ok) throw new Error("Hotmart ofertas falhou (" + response.status + ").");
+    const payload = await response.json() as { items?: HotmartPlan[]; page_info?: { next_page_token?: string } };
+    for (const offer of payload.items ?? []) {
+      const code = offer.code?.trim();
+      const name = offer.name?.trim();
+      if (!code || !name || (!namedOffers.has(name.replace(/\s*\|\s*/g, " | ").toLowerCase()) && code.toUpperCase() !== "YDLN8XYY")) continue;
+      const cohort = extractHotmartCohort({ plan: { name } });
+      if (!cohort) continue;
+      const key = "[oferta:" + code + "] " + name;
+      plans.set(key, { cohort_number: cohort.cohortNumber, cohort_name: name, plan_name: key, plan_code: code, product_name: productName });
+    }
+    const next = payload.page_info?.next_page_token?.trim();
+    if (!next) break;
+    if (seenTokens.has(next) || page === 99) throw new Error("Não foi possível concluir o catálogo de ofertas da Hotmart.");
+    seenTokens.add(next);
+    pageToken = next;
+  }
+  if (!plans.size) throw new Error("Nenhuma turma foi encontrada nos nomes dos planos da Hotmart.");
   return [...plans.values()];
 }
 
@@ -240,22 +313,26 @@ async function refreshCohortCatalog(admin: ReturnType<typeof serviceClient>, acc
   return { plans, cohorts };
 }
 
-function automaticGroupName(productName: string, cohortNumber: number) {
+function automaticGroupName(productName: string, cohortNumber: number, cohortName: string | null) {
   const shortName = productName.replace(/^Casa de Isabel\s*[-–—]\s*/i, "").trim() || productName;
-  return `${shortName} · Turma ${cohortNumber}`;
+  return cohortName || `${shortName} · Turma ${cohortNumber}`;
 }
 
 async function ensureAutomaticGroups(
   admin: ReturnType<typeof serviceClient>,
   userId: string,
-  catalogs: Array<{ product: { id: string; name: string }; catalog: { cohorts: number[] } }>,
+  catalogs: Array<{ product: { id: string; name: string }; catalog: { plans: CohortPlan[]; cohorts: number[] } }>,
 ) {
-  const desired = catalogs.flatMap(({ product, catalog }) => catalog.cohorts.map((cohortNumber) => ({
-    product_id: product.id,
-    product_name: product.name,
-    cohort_number: cohortNumber,
-    name: automaticGroupName(product.name, cohortNumber),
-  })));
+  const desired = catalogs.flatMap(({ product, catalog }) => catalog.cohorts.map((cohortNumber) => {
+    const cohortName = catalog.plans.find((plan) => plan.cohort_number === cohortNumber)?.cohort_name ?? null;
+    return {
+      product_id: product.id,
+      product_name: product.name,
+      cohort_number: cohortNumber,
+      cohort_name: cohortName,
+      name: automaticGroupName(product.name, cohortNumber, cohortName),
+    };
+  }));
   const productIds = [...new Set(desired.map((group) => group.product_id))];
   const legacyProductId = Deno.env.get("HOTMART_PRODUCT_ID")?.trim();
   if (legacyProductId && productIds.includes(legacyProductId)) {
@@ -273,7 +350,7 @@ async function ensureAutomaticGroups(
   }
   const { data: existing, error: existingError } = await admin
     .from("student_groups")
-    .select("id,name,product_id,cohort_number")
+    .select("id,name,product_id,cohort_number,cohort_name")
     .in("product_id", productIds);
   if (existingError) throw new Error(`Falha ao consultar os grupos automáticos: ${existingError.message}`);
 
@@ -287,12 +364,13 @@ async function ensureAutomaticGroups(
   if (missing.length) {
     const { data: inserted, error: insertError } = await admin.from("student_groups").insert(missing.map((group) => ({
       name: group.name,
-      description: `Grupo criado automaticamente pela Hotmart para ${group.product_name}, Turma ${group.cohort_number}.`,
+      description: `Grupo criado automaticamente pela Hotmart para ${group.product_name}, ${group.cohort_name || `Turma ${group.cohort_number}`}.`,
       product_id: group.product_id,
       cohort_number: group.cohort_number,
+      cohort_name: group.cohort_name,
       is_joinable: false,
       created_by: userId,
-    }))).select("id,name,product_id,cohort_number");
+    }))).select("id,name,product_id,cohort_number,cohort_name");
     if (insertError) throw new Error(`Falha ao criar os grupos automáticos: ${insertError.message}`);
     for (const group of inserted ?? []) {
       byScope.set(`${String(group.product_id)}:${Number(group.cohort_number)}`, {
@@ -315,11 +393,12 @@ async function groupCohortPlans(admin: ReturnType<typeof serviceClient>, groupId
   if (groupError || !group?.cohort_number || !group.product_id) throw new Error("Grupo sem produto ou turma definidos.");
   if (String(group.product_id) !== productId) throw new Error("O grupo pertence a outro produto da Hotmart.");
   const cohortNumber = Number(group.cohort_number);
-  const { data: plans, error: plansError } = await admin.from("hotmart_cohort_plans").select("plan_name").eq("product_id", productId).eq("cohort_number", cohortNumber).eq("active", true);
+  const { data: plans, error: plansError } = await admin.from("hotmart_cohort_plans").select("plan_name,plan_code").eq("product_id", productId).eq("cohort_number", cohortNumber).eq("active", true);
   if (plansError) throw new Error(`Falha ao consultar os planos da turma: ${plansError.message}`);
-  const planNames = [...new Set((plans ?? []).map((plan) => String(plan.plan_name).trim()).filter(Boolean))];
-  if (!planNames.length) throw new Error(`A Turma ${cohortNumber} não está no catálogo atual. Clique em “Atualizar turmas” antes de sincronizar os alunos.`);
-  return { cohortNumber, planNames };
+  const planNames = [...new Set((plans ?? []).filter((plan) => !String(plan.plan_name).startsWith("[oferta:")).map((plan) => String(plan.plan_name).trim()).filter(Boolean))];
+  const offerCodes = new Set((plans ?? []).flatMap((plan) => String(plan.plan_name).startsWith("[oferta:") && plan.plan_code ? [String(plan.plan_code)] : []));
+  if (!planNames.length && !offerCodes.size) throw new Error(`A Turma ${cohortNumber} não está no catálogo atual. Clique em “Atualizar turmas” antes de sincronizar os alunos.`);
+  return { cohortNumber, planNames, offerCodes };
 }
 
 async function fetchSubscriptionPage(accessToken: string, productId: string, planNames: string[], pageToken?: string) {
@@ -339,20 +418,24 @@ async function fetchSubscriptionPage(accessToken: string, productId: string, pla
   return { items: payload.items ?? [], nextPageToken: payload.page_info?.next_page_token || null, statuses };
 }
 
-function buildRoster(subscriptions: HotmartSubscription[], productId: string, syncedAt: string) {
+function buildRoster(subscriptions: HotmartSubscription[], productId: string, syncedAt: string, scope: Awaited<ReturnType<typeof groupCohortPlans>>) {
   const deduplicated = new Map<string, Record<string, unknown>>();
   for (const item of subscriptions) {
     const email = item.subscriber?.email?.trim().toLowerCase();
-    const cohort = extractHotmartCohort(item);
-    if (!email || !cohort) continue;
-    const key = `${cohort.cohortNumber}:${email}`;
+    const matchesPlan = scope.planNames.includes(item.plan?.name?.trim() ?? "");
+    const matchesOffer = scope.offerCodes.has(item.offer?.code?.trim() ?? "");
+    if (!email || (!matchesPlan && !matchesOffer)) continue;
+    const key = `${scope.cohortNumber}:${email}`;
+    const period = subscriptionPeriod(item);
     deduplicated.set(key, {
-      cohort_number: cohort.cohortNumber,
+      cohort_number: scope.cohortNumber,
       email,
       full_name: item.subscriber?.name?.trim() || null,
       external_student_id: item.subscriber?.ucode ?? item.subscriber_code ?? (item.subscription_id == null ? null : String(item.subscription_id)),
       subscription_status: item.status?.toUpperCase() ?? null,
       plan_name: item.plan?.name ?? null,
+      subscription_started_at: period.startedAt,
+      subscription_expires_at: period.expiresAt,
       product_id: String(item.product?.id ?? productId),
       active: true,
       synced_at: syncedAt,
@@ -429,6 +512,7 @@ Deno.serve(async (req) => {
           product_id: product.id,
           product_name: product.name,
           cohort_number,
+          cohort_name: catalog.plans.find((plan) => plan.cohort_number === cohort_number)?.cohort_name ?? null,
           plan_count: catalog.plans.filter((plan) => plan.cohort_number === cohort_number).length,
         }))),
         plans: catalogs.reduce((total, entry) => total + entry.catalog.plans.length, 0),
@@ -468,9 +552,9 @@ Deno.serve(async (req) => {
       if (currentToken && run.seen_page_tokens.includes(currentToken)) throw new Error("A Hotmart repetiu o cursor de paginação e a sincronização foi interrompida com segurança.");
       const cohort = await groupCohortPlans(admin, run.group_id, run.product_id);
       const accessToken = await hotmartAccessToken();
-      const page = await fetchSubscriptionPage(accessToken, run.product_id, cohort.planNames, currentToken);
+      const page = await fetchSubscriptionPage(accessToken, run.product_id, cohort.offerCodes.size ? [] : cohort.planNames, currentToken);
       const syncedAt = new Date().toISOString();
-      const pageRoster = buildRoster(page.items, run.product_id, syncedAt).filter((row) => Number(row.cohort_number) === cohort.cohortNumber);
+      const pageRoster = buildRoster(page.items, run.product_id, syncedAt, cohort);
       if (pageRoster.length) {
         const { error } = await admin.from("hotmart_roster_sync_rows").upsert(pageRoster.map((payload) => ({
           run_id: run.id,
