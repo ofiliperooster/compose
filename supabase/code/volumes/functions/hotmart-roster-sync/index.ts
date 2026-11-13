@@ -281,11 +281,13 @@ async function fetchCohortPlans(accessToken: string, productId: string, productN
     for (const offer of payload.items ?? []) {
       const code = offer.code?.trim();
       const name = offer.name?.trim();
-      if (!code || !name || (!namedOffers.has(name.replace(/\s*\|\s*/g, " | ").toLowerCase()) && code.toUpperCase() !== "YDLN8XYY")) continue;
+      if (!code || !name) continue;
       const cohort = extractHotmartCohort({ plan: { name } });
       if (!cohort) continue;
+      const listedOffer = namedOffers.has(name.replace(/\s*\|\s*/g, " | ").toLowerCase());
+      if (cohort.cohortName !== null && !listedOffer && code.toUpperCase() !== "YDLN8XYY") continue;
       const key = "[oferta:" + code + "] " + name;
-      plans.set(key, { cohort_number: cohort.cohortNumber, cohort_name: name, plan_name: key, plan_code: code, product_name: productName });
+      plans.set(key, { cohort_number: cohort.cohortNumber, cohort_name: cohort.cohortName, plan_name: key, plan_code: code, product_name: productName });
     }
     const next = payload.page_info?.next_page_token?.trim();
     if (!next) break;
