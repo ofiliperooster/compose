@@ -1,5 +1,6 @@
 import { createClient } from "@supabase/supabase-js";
 import { extractHotmartCohort } from "../hotmart-auth/cohort.ts";
+import { cancelledStatuses, compareSubscriptionPeriods, currentStatuses, isSubscriptionEligible, subscriptionPeriod } from "../hotmart-auth/subscription-period.ts";
 
 type SyncRequest = {
   action?: "sync" | "cohorts";
@@ -24,34 +25,13 @@ type HotmartSubscription = {
   subscription_id?: number | string;
   status?: string;
   accession_date?: number | string;
-  end_accession_date?: number | string;
   date_next_charge?: number | string;
-  plan?: { name?: string; id?: number | string; recurrency_period?: number; max_charge_cycles?: number };
+  plan?: { name?: string; id?: number | string };
   offer?: { code?: string };
   product?: { id?: number | string; name?: string };
   subscriber?: { name?: string; email?: string; ucode?: string };
 };
 
-function hotmartDate(value: number | string | undefined) {
-  if (value == null || value === "") return null;
-  const numeric = Number(value);
-  if (!Number.isFinite(numeric) || numeric <= 0) return null;
-  const milliseconds = numeric < 10_000_000_000 ? numeric * 1000 : numeric;
-  const date = new Date(milliseconds);
-  return Number.isNaN(date.getTime()) ? null : date.toISOString().slice(0, 10);
-}
-
-function subscriptionPeriod(subscription: HotmartSubscription) {
-  const startedAt = hotmartDate(subscription.accession_date);
-  let expiresAt = hotmartDate(subscription.end_accession_date);
-  if (!expiresAt && startedAt && subscription.plan?.recurrency_period && subscription.plan?.max_charge_cycles) {
-    const calculated = new Date(`${startedAt}T12:00:00Z`);
-    calculated.setUTCDate(calculated.getUTCDate() + subscription.plan.recurrency_period * subscription.plan.max_charge_cycles);
-    expiresAt = calculated.toISOString().slice(0, 10);
-  }
-  if (!expiresAt) expiresAt = hotmartDate(subscription.date_next_charge);
-  return { startedAt, expiresAt };
-}
 type HotmartProduct = { id?: number | string; ucode?: string; name?: string };
 type HotmartPlan = { code?: string; name?: string };
 type CohortPlan = { cohort_number: number; cohort_name: string | null; plan_name: string; plan_code: string | null; product_name: string };
@@ -150,8 +130,8 @@ async function hotmartAccessToken() {
 }
 
 function configuredStatuses() {
-  const raw = Deno.env.get("HOTMART_ROSTER_STATUSES") ?? "ACTIVE,DELAYED,OVERDUE";
-  return [...new Set(raw.split(",").map((value) => value.trim().toUpperCase()).filter(Boolean))];
+  const raw = Deno.env.get("HOTMART_ROSTER_STATUSES") ?? currentStatuses.join(",");
+  return [...new Set(raw.split(",").map((value) => value.trim().toUpperCase()).filter(Boolean).concat(cancelledStatuses))];
 }
 
 function normalizedProductName(value: string) {
@@ -422,12 +402,13 @@ async function fetchSubscriptionPage(accessToken: string, productId: string, pla
 
 function buildRoster(subscriptions: HotmartSubscription[], productId: string, syncedAt: string, scope: Awaited<ReturnType<typeof groupCohortPlans>>) {
   const deduplicated = new Map<string, Record<string, unknown>>();
-  for (const item of subscriptions) {
+  for (const item of [...subscriptions].sort(compareSubscriptionPeriods)) {
     const email = item.subscriber?.email?.trim().toLowerCase();
     const matchesPlan = scope.planNames.includes(item.plan?.name?.trim() ?? "");
     const matchesOffer = scope.offerCodes.has(item.offer?.code?.trim() ?? "");
-    if (!email || (!matchesPlan && !matchesOffer)) continue;
+    if (!email || (!matchesPlan && !matchesOffer) || !isSubscriptionEligible(item)) continue;
     const key = `${scope.cohortNumber}:${email}`;
+    if (deduplicated.has(key)) continue;
     const period = subscriptionPeriod(item);
     deduplicated.set(key, {
       cohort_number: scope.cohortNumber,
