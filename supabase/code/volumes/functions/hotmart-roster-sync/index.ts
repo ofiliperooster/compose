@@ -76,6 +76,8 @@ function serviceClient() {
   });
 }
 
+class HotmartRequestTimeout extends Error {}
+
 async function fetchWithTimeout(input: string | URL, init: RequestInit, timeoutMs = 25_000) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
@@ -83,7 +85,7 @@ async function fetchWithTimeout(input: string | URL, init: RequestInit, timeoutM
     return await fetch(input, { ...init, signal: controller.signal });
   } catch (error) {
     if (error instanceof DOMException && error.name === "AbortError") {
-      throw new Error(`A Hotmart não respondeu em ${Math.round(timeoutMs / 1000)} segundos. Tente novamente.`);
+      throw new HotmartRequestTimeout(`A Hotmart não respondeu em ${Math.round(timeoutMs / 1000)} segundos. Tente novamente.`);
     }
     throw error;
   } finally {
@@ -530,7 +532,6 @@ Deno.serve(async (req) => {
     if (run.status === "failed") return json({ error: "sync_run_failed", message: "A sincronização anterior falhou. Inicie novamente." }, 409);
 
     if (run.status === "collecting") {
-      if (run.pages >= 500) throw new Error("A Hotmart excedeu o limite seguro de 500 páginas. Revise o produto e os filtros.");
       const currentToken = run.pages > 0 ? run.next_page_token || undefined : undefined;
       if (currentToken && run.seen_page_tokens.includes(currentToken)) throw new Error("A Hotmart repetiu o cursor de paginação e a sincronização foi interrompida com segurança.");
       const cohort = await groupCohortPlans(admin, run.group_id, run.product_id);
@@ -623,6 +624,9 @@ Deno.serve(async (req) => {
   } catch (error) {
     if (error instanceof Response) return new Response(error.body, { status: error.status, headers: { ...corsHeaders, "Content-Type": "application/json", "Cache-Control": "no-store" } });
     const message = error instanceof Error ? error.message : String(error);
+    if (error instanceof HotmartRequestTimeout && activeRunId) {
+      return json({ status: "retry_page", run_id: activeRunId, message });
+    }
     if (activeRunId) {
       try {
         await serviceClient().from("hotmart_roster_sync_runs").update({ status: "failed", error: message.slice(0, 1000), updated_at: new Date().toISOString() }).eq("id", activeRunId);
