@@ -1,11 +1,14 @@
-import { createClient, type User } from "@supabase/supabase-js";
+import { createClient, type User } from "npm:@supabase/supabase-js@2.114.0";
 import { extractHotmartCohort } from "../hotmart-auth/cohort.ts";
+import { cancelledStatuses, compareSubscriptionPeriods, currentStatuses, isSubscriptionEligible, subscriptionPeriod } from "../hotmart-auth/subscription-period.ts";
 
 type AccessRequest = { email?: string };
 type HotmartSubscription = {
   status?: string;
   subscriber_code?: string;
   subscription_id?: number | string;
+  accession_date?: number | string;
+  date_next_charge?: number | string;
   subscriber?: { email?: string; name?: string; ucode?: string };
   plan?: { name?: string };
   product?: { id?: number | string };
@@ -25,8 +28,12 @@ type ManualAccessGrant = {
   cohort_number: number;
   full_name: string | null;
 };
+type CourtesyAccessGrant = {
+  email: string;
+  access_expires_at: string;
+  created_at: string;
+};
 
-const ACCESS_STATUSES = ["ACTIVE", "DELAYED", "OVERDUE"] as const;
 const DEFAULT_ACCESS_PRODUCT_NAMES = [
   "Casa de Isabel - Ensino e cuidado",
   "Casa de Isabel - Tornando-se uma mentora",
@@ -47,6 +54,7 @@ function requiredEnv(name: string) {
   if (!value) throw new Error(`${name} não configurada`);
   return value;
 }
+
 
 function serviceClient() {
   return createClient(requiredEnv("SUPABASE_URL"), requiredEnv("SUPABASE_SERVICE_ROLE_KEY"), {
@@ -144,13 +152,14 @@ async function liveEligibleSubscription(email: string): Promise<EligibilityLooku
   const matches: EligibilityLookup["matches"] = [];
   for (const productId of productIds) {
     let pageToken: string | null = null;
+    const eligible: HotmartSubscription[] = [];
     for (let page = 0; page < 10; page += 1) {
       const url = new URL("https://developers.hotmart.com/payments/api/v1/subscriptions");
       url.searchParams.set("product_id", productId);
       url.searchParams.set("subscriber_email", email);
       url.searchParams.set("accession_date", "0");
       url.searchParams.set("max_results", "100");
-      for (const status of ACCESS_STATUSES) url.searchParams.append("status", status);
+      for (const status of [...currentStatuses, ...cancelledStatuses]) url.searchParams.append("status", status);
       if (pageToken) url.searchParams.set("page_token", pageToken);
       const response = await fetchWithTimeout(url, {
         headers: { Authorization: `Bearer ${accessToken}`, "Content-Type": "application/json" },
@@ -160,18 +169,17 @@ async function liveEligibleSubscription(email: string): Promise<EligibilityLooku
         items?: HotmartSubscription[];
         page_info?: { next_page_token?: string | null };
       };
-      const eligible = (payload.items ?? []).find((item) =>
-        item.subscriber?.email?.trim().toLowerCase() === email &&
-        ACCESS_STATUSES.includes((item.status?.toUpperCase() ?? "") as typeof ACCESS_STATUSES[number])
-      );
-      if (eligible) {
-        matches.push({ subscription: eligible, productId });
-        break;
-      }
+      eligible.push(...(payload.items ?? []).filter((item) =>
+        item.subscriber?.email?.trim().toLowerCase() === email && isSubscriptionEligible(item)
+      ));
       pageToken = payload.page_info?.next_page_token ?? null;
       if (!pageToken) break;
     }
+    if (pageToken) throw new Error("A consulta de assinaturas excedeu o limite de páginas");
+    const subscription = eligible.sort(compareSubscriptionPeriods)[0];
+    if (subscription) matches.push({ subscription, productId });
   }
+  matches.sort((left, right) => compareSubscriptionPeriods(left.subscription, right.subscription));
   return { matches, productIds, source: "hotmart" as const };
 }
 
@@ -200,6 +208,72 @@ async function manualAccessGrants(
   return (data ?? []) as ManualAccessGrant[];
 }
 
+async function courtesyAccessGrant(
+  admin: ReturnType<typeof serviceClient>,
+  email: string,
+): Promise<CourtesyAccessGrant | null> {
+  const today = new Date().toISOString().slice(0, 10);
+  const { data, error } = await admin
+    .from("courtesy_access_grants")
+    .select("email,access_expires_at,created_at")
+    .eq("email", email)
+    .eq("active", true)
+    .gte("access_expires_at", today)
+    .maybeSingle();
+  if (error) throw new Error(`Falha ao consultar acesso de cortesia: ${error.message}`);
+  return data as CourtesyAccessGrant | null;
+}
+
+async function activateCourtesyProfile(
+  admin: ReturnType<typeof serviceClient>,
+  user: User,
+  grant: CourtesyAccessGrant,
+) {
+  const { data: profile, error: profileError } = await admin.from("profiles").select("id").eq("id", user.id).maybeSingle();
+  if (profileError) throw new Error(profileError.message);
+  const values = {
+    full_name: user.user_metadata?.full_name || user.email?.split("@")[0] || "Aluno(a)",
+    subscription_status: "active",
+    subscription_started_at: grant.created_at.slice(0, 10),
+    subscription_expires_at: grant.access_expires_at,
+  };
+  const response = profile
+    ? await admin.from("profiles").update(values).eq("id", user.id)
+    : await admin.from("profiles").insert({ id: user.id, role: "student", cohort_number: 11, ...values });
+  if (response.error) throw new Error(`Falha ao liberar o perfil de cortesia: ${response.error.message}`);
+}
+
+async function appReleaseAllowed(
+  admin: ReturnType<typeof serviceClient>,
+  email: string,
+  cohorts: Array<{ product_id: string; cohort_number: number }>,
+) {
+  const { data: administrator } = await admin
+    .from("admin_accounts")
+    .select("user_id")
+    .eq("email", email)
+    .eq("active", true)
+    .maybeSingle();
+  if (administrator) return true;
+
+  const { data: settings, error: settingsError } = await admin
+    .from("app_release_settings")
+    .select("gradual_enabled")
+    .eq("singleton", true)
+    .maybeSingle();
+  // Keep authentication available while the migration and Edge Function are
+  // being deployed in either order. Once the table exists, access is fail-closed.
+  if (settingsError) return true;
+  if (settings?.gradual_enabled === false) return true;
+
+  const { data: released, error: releaseError } = await admin
+    .from("app_release_cohorts")
+    .select("product_id,cohort_number");
+  if (releaseError) return true;
+  const releasedKeys = new Set((released ?? []).map((item) => `${item.product_id}:${item.cohort_number}`));
+  return cohorts.some((cohort) => releasedKeys.has(`${cohort.product_id}:${cohort.cohort_number}`));
+}
+
 async function activateManualProfile(
   admin: ReturnType<typeof serviceClient>,
   user: User,
@@ -226,6 +300,7 @@ async function saveEligibility(
 ) {
   const cohort = extractHotmartCohort(subscription);
   if (cohort) {
+    const period = subscriptionPeriod(subscription);
     const resolvedProductId = String(subscription.product?.id ?? productId);
     const { error } = await admin.from("hotmart_cohort_roster").upsert({
       cohort_number: cohort.cohortNumber,
@@ -234,6 +309,8 @@ async function saveEligibility(
       external_student_id: subscription.subscriber?.ucode ?? subscription.subscriber_code ?? (subscription.subscription_id == null ? null : String(subscription.subscription_id)),
       subscription_status: subscription.status?.toUpperCase() ?? "ACTIVE",
       plan_name: subscription.plan?.name ?? null,
+      subscription_started_at: period.startedAt,
+      subscription_expires_at: period.expiresAt,
       product_id: resolvedProductId,
       active: true,
       synced_at: new Date().toISOString(),
@@ -306,9 +383,12 @@ async function activateProfile(
 ) {
   const { data: profile, error: profileError } = await admin.from("profiles").select("id").eq("id", user.id).maybeSingle();
   if (profileError) throw new Error(profileError.message);
+  const period = subscriptionPeriod(subscription);
   const values = {
     full_name: subscription.subscriber?.name?.trim() || user.user_metadata?.full_name || user.email?.split("@")[0] || "Aluno(a)",
     subscription_status: "active",
+    ...(period.startedAt ? { subscription_started_at: period.startedAt } : {}),
+    ...(period.expiresAt ? { subscription_expires_at: period.expiresAt } : {}),
     ...(cohortNumber ? { cohort_number: cohortNumber } : {}),
   };
   const response = profile
@@ -332,9 +412,33 @@ Deno.serve(async (req) => {
       return json({ error: "email_mismatch", message: "O e-mail não corresponde à sessão atual." }, 403);
     }
 
+    // Courtesy access is independent from Hotmart and from the gradual cohort
+    // rollout. Expiration is enforced on every authentication/restored session.
+    const courtesyGrant = await courtesyAccessGrant(admin, email);
+    if (courtesyGrant) {
+      if (currentUser) {
+        await activateCourtesyProfile(admin, currentUser, courtesyGrant);
+        return json({ status: "validated", source: "courtesy", expires_at: courtesyGrant.access_expires_at });
+      }
+      return json({
+        status: "eligible",
+        source: "courtesy",
+        full_name: email.split("@")[0],
+        cohort_number: 11,
+        expires_at: courtesyGrant.access_expires_at,
+      });
+    }
+
     const manualGrants = await manualAccessGrants(admin, email);
     if (manualGrants.length) {
       const primary = manualGrants[0];
+      const released = await appReleaseAllowed(admin, email, manualGrants);
+      if (!released) {
+        return json({
+          error: "cohort_not_released",
+          message: "O acesso ao aplicativo ainda não foi liberado para a sua turma.",
+        }, 403);
+      }
       if (currentUser) {
         await activateManualProfile(admin, currentUser, primary);
         return json({
@@ -369,6 +473,15 @@ Deno.serve(async (req) => {
       ...match,
       cohort: await saveEligibility(admin, email, match.subscription, match.productId),
     })));
+    const released = await appReleaseAllowed(admin, email, saved
+      .filter((match) => match.cohort?.cohortNumber)
+      .map((match) => ({ product_id: match.productId, cohort_number: match.cohort!.cohortNumber })));
+    if (!released) {
+      return json({
+        error: "cohort_not_released",
+        message: "O acesso ao aplicativo ainda não foi liberado para a sua turma.",
+      }, 403);
+    }
     await revokeIneligibleProductAccess(
       admin,
       email,
