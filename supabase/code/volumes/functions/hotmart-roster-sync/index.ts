@@ -21,6 +21,7 @@ type SyncRun = {
   fetched: number;
 };
 type HotmartSubscription = {
+  transaction?: string;
   subscriber_code?: string;
   subscription_id?: number | string;
   status?: string;
@@ -419,6 +420,7 @@ function buildRoster(subscriptions: HotmartSubscription[], productId: string, sy
       external_student_id: item.subscriber?.ucode ?? item.subscriber_code ?? (item.subscription_id == null ? null : String(item.subscription_id)),
       subscription_status: item.status?.toUpperCase() ?? null,
       plan_name: item.plan?.name ?? null,
+      hotmart_transaction: item.transaction?.trim() || null,
       subscription_started_at: period.startedAt,
       subscription_expires_at: period.expiresAt,
       product_id: String(item.product?.id ?? productId),
