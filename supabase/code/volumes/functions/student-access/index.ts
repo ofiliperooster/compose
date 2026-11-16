@@ -5,6 +5,7 @@ import { cancelledStatuses, compareSubscriptionPeriods, currentStatuses, isSubsc
 type AccessRequest = { email?: string };
 type HotmartSubscription = {
   status?: string;
+  transaction?: string;
   subscriber_code?: string;
   subscription_id?: number | string;
   accession_date?: number | string;
@@ -146,7 +147,23 @@ async function accessProductIds(accessToken: string) {
   return resolved;
 }
 
-async function liveEligibleSubscription(email: string): Promise<EligibilityLookup> {
+type SubscriptionPurchase = { transaction?: string; status?: string; approved_date?: number; recurrency_number?: number };
+
+async function latestPaidPurchase(accessToken: string, subscription: HotmartSubscription) {
+  if (!subscription.subscriber_code) throw new Error("Assinatura Hotmart sem código de assinante");
+  const url = new URL("https://developers.hotmart.com/payments/api/v1/subscriptions/" +
+    encodeURIComponent(subscription.subscriber_code) + "/purchases");
+  const response = await fetchWithTimeout(url, { headers: { Authorization: "Bearer " + accessToken } });
+  if (!response.ok) throw new Error("Hotmart purchases " + response.status);
+  const purchases = await response.json() as SubscriptionPurchase[];
+  if (!Array.isArray(purchases)) throw new Error("Resposta de compras Hotmart inválida");
+  const relevant = new Set(["APPROVED", "COMPLETE", "PARTIALLY_REFUNDED", "REFUNDED", "CHARGEBACK"]);
+  return purchases.filter((item) => item.transaction && relevant.has(item.status ?? ""))
+    .sort((a, b) => Number(b.recurrency_number ?? 0) - Number(a.recurrency_number ?? 0)
+      || Number(b.approved_date ?? 0) - Number(a.approved_date ?? 0))[0];
+}
+
+async function liveEligibleSubscription(admin: ReturnType<typeof serviceClient>, email: string): Promise<EligibilityLookup> {
   const accessToken = await hotmartAccessToken();
   const productIds = await accessProductIds(accessToken);
   const matches: EligibilityLookup["matches"] = [];
@@ -176,8 +193,23 @@ async function liveEligibleSubscription(email: string): Promise<EligibilityLooku
       if (!pageToken) break;
     }
     if (pageToken) throw new Error("A consulta de assinaturas excedeu o limite de páginas");
-    const subscription = eligible.sort(compareSubscriptionPeriods)[0];
-    if (subscription) matches.push({ subscription, productId });
+    for (const subscription of eligible.sort(compareSubscriptionPeriods)) {
+      const purchase = await latestPaidPurchase(accessToken, subscription);
+      if (!purchase?.transaction) continue;
+      if (purchase.status === "REFUNDED" || purchase.status === "CHARGEBACK") {
+        const { error } = await admin.rpc("record_hotmart_purchase_reversal", {
+          p_product_id: productId, p_transaction: purchase.transaction, p_status: purchase.status,
+        });
+        if (error) throw new Error(error.message);
+        continue;
+      }
+      const { data: reversed, error } = await admin.from("hotmart_reversed_purchases")
+        .select("transaction_code").eq("product_id", productId).eq("transaction_code", purchase.transaction).maybeSingle();
+      if (error) throw new Error(error.message);
+      if (reversed) continue;
+      matches.push({ subscription: { ...subscription, transaction: purchase.transaction }, productId });
+      break;
+    }
   }
   matches.sort((left, right) => compareSubscriptionPeriods(left.subscription, right.subscription));
   return { matches, productIds, source: "hotmart" as const };
@@ -302,20 +334,23 @@ async function saveEligibility(
   if (cohort) {
     const period = subscriptionPeriod(subscription);
     const resolvedProductId = String(subscription.product?.id ?? productId);
-    const { error } = await admin.from("hotmart_cohort_roster").upsert({
+    const { data, error } = await admin.from("hotmart_cohort_roster").upsert({
       cohort_number: cohort.cohortNumber,
       email,
       full_name: subscription.subscriber?.name?.trim() || null,
       external_student_id: subscription.subscriber?.ucode ?? subscription.subscriber_code ?? (subscription.subscription_id == null ? null : String(subscription.subscription_id)),
       subscription_status: subscription.status?.toUpperCase() ?? "ACTIVE",
       plan_name: subscription.plan?.name ?? null,
+      hotmart_transaction: subscription.transaction?.trim() || null,
       subscription_started_at: period.startedAt,
       subscription_expires_at: period.expiresAt,
       product_id: resolvedProductId,
       active: true,
       synced_at: new Date().toISOString(),
-    }, { onConflict: "product_id,cohort_number,email" });
+    }, { onConflict: "product_id,cohort_number,email" }).select("active").single();
     if (error) throw new Error(`Falha ao registrar elegibilidade: ${error.message}`);
+
+    if (!data?.active) return { cohort, revoked: true };
 
     const { data: groups, error: groupsError } = await admin
       .from("student_groups")
@@ -328,7 +363,7 @@ async function saveEligibility(
       if (syncError) throw new Error(`Falha ao vincular a aluna ao grupo: ${syncError.message}`);
     }
   }
-  return cohort;
+  return { cohort, revoked: false };
 }
 
 async function revokeIneligibleProductAccess(
@@ -458,7 +493,7 @@ Deno.serve(async (req) => {
 
     let lookup: EligibilityLookup;
     try {
-      lookup = await liveEligibleSubscription(email);
+      lookup = await liveEligibleSubscription(admin, email);
     } catch {
       return json({ error: "hotmart_unavailable", message: "Não foi possível confirmar a assinatura na Hotmart." }, 503);
     }
@@ -469,10 +504,13 @@ Deno.serve(async (req) => {
       return json({ error: "subscription_not_eligible", message: "Assinatura sem acesso liberado." }, 403);
     }
 
-    const saved = await Promise.all(lookup.matches.map(async (match) => ({
+    const saved = (await Promise.all(lookup.matches.map(async (match) => ({
       ...match,
-      cohort: await saveEligibility(admin, email, match.subscription, match.productId),
-    })));
+      ...await saveEligibility(admin, email, match.subscription, match.productId),
+    })))).filter((match) => !match.revoked);
+    if (!saved.length) {
+      return json({ error: "subscription_not_eligible", message: "Assinatura sem acesso liberado." }, 403);
+    }
     const released = await appReleaseAllowed(admin, email, saved
       .filter((match) => match.cohort?.cohortNumber)
       .map((match) => ({ product_id: match.productId, cohort_number: match.cohort!.cohortNumber })));
